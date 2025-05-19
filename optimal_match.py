@@ -20,100 +20,100 @@ def standardize_features(disease_df, no_disease_df, features):
     disease_features = (disease_df[features] - mean) / std
     no_disease_features = (no_disease_df[features] - mean) / std
     return disease_features, no_disease_features
-import numpy as np
-import pandas as pd
-from scipy.spatial.distance import cdist
-from itertools import permutations
-from tqdm import tqdm
 
-def global_optimal_match(disease_data, no_disease_data, 
-                        disease_features, no_disease_features,
-                        VI):
-    """全局暴力搜索最优匹配（总距离最小）"""
-    # 确保两组数据数量相同
-    assert len(disease_data) == len(no_disease_data), "数据集必须等长"
+# compute the weighted covariance matrix
+def compute_weighted_covariance(disease_features, no_disease_features, weights):
+
+    combined = pd.concat([disease_features, no_disease_features])
+    cov_matrix = combined.cov().values
+
+    W_matrix = np.outer(weights, weights)
+    cov_weighted = cov_matrix / W_matrix
+
+    try:
+        cov_inv = np.linalg.inv(cov_weighted)
+    except np.linalg.LinAlgError:
+        cov_inv = np.linalg.pinv(cov_weighted)
+    return cov_inv
+
+def optimal_matches(disease_data, no_disease_data, 
+                disease_features, no_disease_features, 
+                cov_inv):
+
     n = len(disease_data)
-    
-    # 计算全量距离矩阵
-    distance_matrix = cdist(
-        disease_features.values, 
-        no_disease_features.values, 
-        metric='mahalanobis', 
-        VI=VI
-    )
-    
-    # 初始化最小总距离和最优排列
-    min_total = float('inf')
-    best_perm = None
-    
-    # 遍历所有可能的排列组合
-    total_perms = np.math.factorial(n)
-    with tqdm(permutations(range(n)), total=total_perms, desc="全局搜索进度") as pbar:
-        for perm in pbar:
-            # 计算当前排列的总距离
-            total = sum(distance_matrix[i, perm[i]] for i in range(n))
-            
-            # 更新最优解
-            if total < min_total:
-                min_total = total
-                best_perm = perm
-            pbar.update(1)
-    
-    # 构建结果
-    matches = []
+    m = len(no_disease_data)
+
+# initiallize the matrix
+    cost_matrix = np.full((n, m), np.inf)
+
     for i in range(n):
+        disease_id = disease_data.iloc[i]['ID']
+        mask = (no_disease_data['ID'] != disease_id)
+        valid_j = np.where(mask)[0]
+        
+        if valid_j.size == 0:
+            continue
+
+        distances = cdist(
+            disease_features.iloc[i].values.reshape(1, -1),
+            no_disease_features.iloc[valid_j],
+            metric='mahalanobis',
+            VI=cov_inv
+        )
+        cost_matrix[i, valid_j] = distances.ravel()
+# applied hungarian algorithm
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+    matches = []
+    for i, j in zip(row_ind, col_ind):
+        cost = cost_matrix[i, j]
+        if np.isinf(cost):
+            continue
+        
+        disease_id = disease_data.iloc[i]['ID']
+        disease_date = disease_data.iloc[i]['date']
+        no_disease_id = no_disease_data.iloc[j]['ID']
+        no_disease_date = no_disease_data.iloc[j]['date']
+        
         matches.append({
-            'Disease ID': disease_data.iloc[i]['ID'],
-            'Disease Date': disease_data.iloc[i]['date'],
-            'no Disease ID': no_disease_data.iloc[best_perm[i]]['ID'],
-            'no Disease Date': no_disease_data.iloc[best_perm[i]]['date'],
-            'Distance': distance_matrix[i, best_perm[i]]
+            'Disease ID': disease_id,
+            'Disease Date': disease_date,
+            'no Disease ID': no_disease_id,
+            'no Disease Date': no_disease_date,
+            'Distance': cost
         })
+    
     return pd.DataFrame(matches)
 
-def compute_global_cov_inv(disease_features, no_disease_features, weights=None):
-    """计算全局协方差逆矩阵"""
-    combined = pd.concat([disease_features, no_disease_features])
-    if weights is not None:
-        combined = combined * weights
-    cov_matrix = np.cov(combined.T)
-    cov_reg = cov_matrix + 1e-6 * np.eye(cov_matrix.shape[0])  # 正则化
-    return np.linalg.inv(cov_reg)
-
 def main():
-    # 数据预处理
     features = ['age', 'gender', 'blood_pressure', 'height', 'weight', 'BMI']
     weights = np.array([0.2, 0.1, 0.3, 0.1, 0.1, 0.2])
-    output_path = "global_brute_force_match.csv"
+    output_path = "optimal_match.csv"
 
-    # 加载数据并截断至相同长度
     X_disease = preprocess_data(df_disease, features)
     X_no_disease = preprocess_data(df_no_disease, features)
-    min_len = min(len(X_disease), len(X_no_disease))
-    X_disease = X_disease.iloc[:min_len]
-    X_no_disease = X_no_disease.iloc[:min_len]
 
-    # 标准化特征
     disease_features, no_disease_features = standardize_features(
         X_disease, X_no_disease, features
     )
 
-    # 计算全局协方差逆矩阵
-    VI = compute_global_cov_inv(disease_features, no_disease_features, weights)
+    cov_inv = compute_weighted_covariance(
+        disease_features, no_disease_features, weights
+    )
 
-    # 执行全局暴力匹配
-    matches_df = global_optimal_match(
+    matches_df = optimal_matches(
         disease_data=X_disease,
         no_disease_data=X_no_disease,
         disease_features=disease_features,
         no_disease_features=no_disease_features,
-        VI=VI
+        cov_inv=cov_inv,
     )
 
-    # 保存结果
     matches_df.to_csv(output_path, index=False)
-    print("总距离最小值:", matches_df['Distance'].sum())
-    print("匹配结果样例:\n", matches_df.head())
+    print(matches_df.head(20))
+    
+    total_distance = matches_df['Distance'].sum()
+    print(f"Total distance: {total_distance:.4f}")
 
 if __name__ == "__main__":
     main()
